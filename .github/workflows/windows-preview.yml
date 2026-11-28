@@ -1,0 +1,66 @@
+name: Build Sunline for Windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-preview.yml'
+      - 'source/**'
+      - 'patches/**'
+      - 'setup/**'
+      - 'README.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-preview:
+    runs-on: windows-2022
+    timeout-minutes: 55
+    env:
+      RELEASE_VERSION: v2.1.0-preview.1
+      VICTORY_COMMIT: 63b902fe1720a5188ee79d94a88c8de0470f6349
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test and build the launcher
+        working-directory: source
+        shell: pwsh
+        run: |
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked
+      - name: Build the pinned VIctory-NVIDIA engine
+        shell: pwsh
+        run: |
+          $engine = Join-Path $env:RUNNER_TEMP 'sunline-victory'
+          git clone --no-checkout https://github.com/trustno1-coder/VIctory-NVIDIA.git $engine
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $engine checkout --detach $env:VICTORY_COMMIT
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $patch = Join-Path $PWD 'patches/nv-ours.patch'
+          git -C $engine apply -- $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Push-Location $engine
+          try {
+            cargo build --locked --release -p victory
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Set-Content -Encoding ascii sunline-build.txt "${env:VICTORY_COMMIT} p2"
+          } finally {
+            Pop-Location
+          }
+      - name: Package the Windows preview
+        shell: pwsh
+        run: |
+          $engine = Join-Path $env:RUNNER_TEMP 'sunline-victory'
+          ./setup/package-windows.ps1 -LauncherExe ./source/target/release/sunline.exe -VictoryRepo $engine -OutputDirectory ./dist -Version $env:RELEASE_VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sunline-Windows-preview
+          path: |
+            dist/Sunline-v2.1.0-preview.1.zip
+            dist/Sunline-v2.1.0-preview.1.sha256
+          if-no-files-found: error
