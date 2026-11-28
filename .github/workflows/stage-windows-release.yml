@@ -1,0 +1,136 @@
+name: Verify and stage Sunline Windows release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  stage:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    env:
+      BUILD_RUN: '46129051643'
+      BUILD_COMMIT: 7ecd2156c2221c9c389b1a3ae1c54117fd452628
+      RELEASE_TAG: v2.1.0-preview.1
+    steps:
+      - name: Verify the successful build and its source revision
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:BUILD_RUN" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($run.conclusion -ne 'success' -or $run.head_sha -ne $env:BUILD_COMMIT -or
+              $run.path -ne '.github/workflows/windows-preview.yml') {
+            throw 'The selected run is not the successful Sunline build for this release.'
+          }
+      - uses: actions/download-artifact@v4
+        with:
+          name: Sunline-Windows-preview
+          path: package
+          github-token: ${{ github.token }}
+          run-id: ${{ env.BUILD_RUN }}
+      - name: Verify the checksum, archive contents and Windows binaries
+        shell: pwsh
+        run: |
+          $basename = "Sunline-$env:RELEASE_TAG"
+          $zip = "package/$basename.zip"
+          $sum = (Get-Content -LiteralPath "package/$basename.sha256" -Raw).Trim() -split '\s+', 2
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sum.Count -ne 2 -or $sum[0] -cne $actual -or $sum[1] -cne "$basename.zip") {
+            throw 'The signed-off Windows ZIP does not match its SHA-256 manifest.'
+          }
+          $expected = @(
+            'Sunline/Sunline.exe'
+            'Sunline/README.md'
+            'Sunline/LICENSE'
+            'Sunline/patches/nv-ours.patch'
+            'Sunline/patches/newbase-nvidia.patch'
+            'Sunline/setup/setup-nv.bat'
+            'Sunline/setup/setup-new.bat'
+            'Sunline/setup/build-progress.ps1'
+            'Sunline/VIctory-NVIDIA/LICENSE'
+            'Sunline/VIctory-NVIDIA/sunline-build.txt'
+            'Sunline/VIctory-NVIDIA/target/release/victory.exe'
+            'Sunline/VIctory-NVIDIA/scripts/play-foxhound.ps1'
+            'Sunline/VIctory-NVIDIA/scripts/get-d3d12.ps1'
+            'Sunline/VIctory-NVIDIA/scripts/get-nvidia-sdks.ps1'
+          )
+          $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $zip).Path)
+          try {
+            $files = @{}
+            foreach ($entry in $archive.Entries) {
+              $name = $entry.FullName.Replace('\', '/')
+              if ($name.EndsWith('/')) { continue }
+              if ($name -cnotin $expected -or $files.ContainsKey($name) -or $entry.Length -eq 0) {
+                throw "Unexpected, empty or duplicate entry: $name"
+              }
+              $files[$name] = $entry
+            }
+            if ($files.Count -ne $expected.Count) { throw 'Windows package is incomplete.' }
+            foreach ($name in $expected.Where({ $_.EndsWith('.exe') })) {
+              $reader = [IO.BinaryReader]::new($files[$name].Open())
+              try {
+                if ($reader.ReadUInt16() -ne 0x5a4d) { throw "Invalid Windows binary: $name" }
+              } finally {
+                $reader.Dispose()
+              }
+            }
+            $marker = [IO.StreamReader]::new($files['Sunline/VIctory-NVIDIA/sunline-build.txt'].Open())
+            try {
+              if ($marker.ReadToEnd().Trim() -ne '63b902fe1720a5188ee79d94a88c8de0470f6349 p2') {
+                throw 'The bundled engine revision does not match the launcher.'
+              }
+            } finally {
+              $marker.Dispose()
+            }
+          } finally {
+            $archive.Dispose()
+          }
+          Write-Host "$($expected.Count) package files verified. SHA-256 $actual"
+      - name: Attach the verified assets to the matching release draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = "repos/$env:GITHUB_REPOSITORY"
+          $releases = gh api "$repo/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $drafts = @($releases | Where-Object { $_.draft -and $_.tag_name -ceq $env:RELEASE_TAG })
+          if ($drafts.Count -ne 1 -or $drafts[0].id -notmatch '^\d+$') {
+            throw 'Expected exactly one matching release draft.'
+          }
+          $draftId = $drafts[0].id
+          gh api --method PATCH "$repo/releases/$draftId" -f "target_commitish=$env:BUILD_COMMIT" --silent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $assets = @{
+            "Sunline-$env:RELEASE_TAG.zip" = 'application/zip'
+            "Sunline-$env:RELEASE_TAG.sha256" = 'text/plain'
+          }
+          $draft = gh api "$repo/releases/$draftId" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($name in $assets.Keys) {
+            $file = Get-Item -LiteralPath "package/$name"
+            $alreadyAttached = @($draft.assets | Where-Object name -CEQ $name)
+            if ($alreadyAttached.Count -gt 0) {
+              $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($alreadyAttached.Count -ne 1 -or $alreadyAttached[0].digest -cne "sha256:$hash") {
+                throw "The draft already contains a non-matching asset: $name"
+              }
+              continue
+            }
+            $uri = "https://uploads.github.com/$repo/releases/$draftId/assets?name=$([uri]::EscapeDataString($name))"
+            $asset = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType $assets[$name] -InFile $file.FullName
+            if ($asset.name -cne $name -or $asset.state -ne 'uploaded' -or $asset.size -ne $file.Length) {
+              throw "GitHub did not confirm the full upload of $name."
+            }
+            Write-Host "Uploaded $name ($($file.Length) bytes)"
+          }
