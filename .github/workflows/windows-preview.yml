@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - '.gitattributes'
       - '.github/workflows/windows-preview.yml'
       - 'source/**'
       - 'patches/**'
@@ -33,6 +34,11 @@ jobs:
           cargo test --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sunline-Launcher-build
+          path: source/target/release/sunline.exe
+          if-no-files-found: error
       - name: Build the pinned VIctory-NVIDIA engine
         shell: pwsh
         run: |
