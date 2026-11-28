@@ -5,8 +5,15 @@
 
 use eframe::egui::{self, Color32, RichText, Stroke};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::io::Read;
+mod game_settings;
+mod menu_music;
+mod navigation;
+
+use game_settings::{FIXED, GAME_ITEMS};
+use menu_music::{MenuMusic, DEFAULT_VOLUME, MAX_VOLUME};
+use navigation::Page;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -22,6 +29,8 @@ const AGILITY_URL: &str = "https://www.nuget.org/api/v2/package/Microsoft.Direct
 enum Build {
     Main,
     New,
+    /// VIctory-NVIDIA (foxhound line) + our fixes: DLSS, Series X 1440p, frame generation.
+    Nvidia,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -38,11 +47,13 @@ struct Settings {
     gpu: Gpu,
     setup_done: bool,
     gpu_confirmed: bool,
-    played_once: bool,
     main_exe: String,
     new_exe: String,
     logs_dir: String,
     background: String,
+    menu_music_file: String,
+    menu_music_volume: u8,
+    menu_music_enabled: bool,
     build: Build,
     series_s: bool,
     output: String,
@@ -67,9 +78,19 @@ struct Settings {
     extra: String,
     main_cache: String,
     new_cache: String,
+    /// The VIctory-NVIDIA repository (its own launcher script is used).
+    nv_repo: String,
+    nv_cache: String,
+    /// DLSS mode: quality, balanced, performance, dlaa, off.
+    dlss: String,
+    /// DLSS frame generation 2x from the start (RTX 40 or later).
+    frame_gen: bool,
+    /// The game's F1 menu settings, chosen here before the game starts (`GAME_ITEMS`):
+    /// variable -> value, written to `victory-settings.txt` at PLAY.
+    game: BTreeMap<String, String>,
+    pending_game: BTreeSet<String>,
     dev_mode: bool,
     tests: Vec<TestProfile>,
-    advanced: bool,
 }
 
 /// A developer test: the current settings plus switches of its own.
@@ -89,11 +110,13 @@ impl Default for Settings {
             gpu: Gpu::Nvidia,
             setup_done: false,
             gpu_confirmed: false,
-            played_once: false,
             main_exe: here(r"victory\main\target\diag\victory.exe"),
             new_exe: here(r"victory\victory.exe"),
             logs_dir: here("logs"),
             background: String::new(),
+            menu_music_file: String::new(),
+            menu_music_volume: DEFAULT_VOLUME,
+            menu_music_enabled: false,
             build: Build::New,
             series_s: true,
             output: "1920x1080".into(),
@@ -118,8 +141,13 @@ impl Default for Settings {
             extra: String::new(),
             main_cache: Settings::home_cache("main"),
             new_cache: Settings::home_cache("new"),
+            nv_repo: here("VIctory-NVIDIA"),
+            nv_cache: std::env::var("LOCALAPPDATA").map(|l| format!(r"{l}\VIctory\cache-nv")).unwrap_or_default(),
+            dlss: "quality".into(),
+            frame_gen: false,
+            game: BTreeMap::new(),
+            pending_game: BTreeSet::new(),
             dev_mode: false,
-            advanced: false,
             tests: vec![
                 TestProfile { name: "Test 1".into(), notes: "Free slot for the next change".into(), extra: String::new() },
                 TestProfile { name: "Test 2".into(), notes: "Free slot for the next change".into(), extra: String::new() },
@@ -134,6 +162,47 @@ impl Settings {
     /// The set measured best so far on this PC (Ryzen 7 7700X, RTX 4070 Ti, 32 GB).
     /// Quality: the sharpest picture with the best frame rate measured.
     fn recommended(&mut self) {
+        self.recommended_classic();
+        // VIctory-NVIDIA + our fixes: DLSS Quality at 2560x1440 (Series X), sharp, no crashes
+        // (2026-11-28); the water's dark squares left out.
+        self.build = Build::Nvidia;
+        self.series_s = false;
+        self.game_defaults();
+    }
+
+    /// The one set we settled on (2026-11-28): Series X 2560x1440, DLSS Quality, frame generation
+    /// 2x on an RTX 40/50 (card-bound: about 33 ms of GPU a frame, 16-19 fps, about twice shown),
+    /// the frame rate held at 120, our light estimate. On AMD: Series S, no DLSS.
+    fn game_defaults(&mut self) {
+        self.game.clear();
+        for item in GAME_ITEMS {
+            self.game.insert(item.var.into(), item.values[0].0.into());
+        }
+        let fg = detect_gpu().map(|(_, n)| n.contains("RTX 40") || n.contains("RTX 50")).unwrap_or(false);
+        self.game.insert("VICTORY_MENU_FRAMEGEN".into(), if fg { "2" } else { "0" }.into());
+        if self.gpu == Gpu::Amd {
+            // No DLSS on AMD: the title's own upscaler, which takes the Series S sizes only.
+            self.game.insert("VICTORY_MENU_CONSOLE".into(), "series-s".into());
+            self.game.insert("VICTORY_MENU_DLSS".into(), "off".into());
+            self.game.insert("VICTORY_MENU_FRAMEGEN".into(), "0".into());
+        }
+        self.sync_game();
+    }
+
+    /// A game setting: chosen here, else its first value.
+    fn game_value(&self, var: &str) -> String {
+        game_settings::value(&self.game, var).to_owned()
+    }
+
+    /// The launcher's own fields (console, DLSS, frame generation) from the game settings.
+    fn sync_game(&mut self) {
+        self.series_s = self.game_value("VICTORY_MENU_CONSOLE") == "series-s";
+        self.dlss = self.game_value("VICTORY_MENU_DLSS");
+        self.frame_gen = self.game_value("VICTORY_MENU_FRAMEGEN") != "0";
+    }
+
+    /// The best set on the 7900XTX builds (before VIctory-NVIDIA).
+    fn recommended_classic(&mut self) {
         // New build (latest VIctory-7900XTX with all Belobug ports): best picture, and with
         // VICTORY_VIEW_BYTES=0 9.8 fps against 5 without it.
         self.build = Build::New;
@@ -157,17 +226,33 @@ impl Settings {
         self.warm_after = true;
     }
 
-    /// Performance: the same as Quality, with the game's own upscaler instead of FSR4:
-    /// about 16 fps instead of 13.4, the picture softer (a little blurry).
-    fn recommended_fast(&mut self) {
-        self.recommended();
-        self.own_upscaler = true;
+    /// Built and current: for VIctory-NVIDIA the build must be of the commit Sunline is made for
+    /// (setup-nv.bat and _NV.bat write it to sunline-build.txt after a good build).
+    fn build_current(&self) -> bool {
+        if !Path::new(&self.victory_exe()).is_file() {
+            return false;
+        }
+        match self.build {
+            Build::Nvidia => std::fs::read_to_string(Path::new(self.nv_repo.trim()).join("sunline-build.txt"))
+                .map(|t| t.trim() == NV_COMMIT)
+                .unwrap_or(false),
+            _ => true,
+        }
     }
 
-    fn victory_exe(&self) -> &str {
+    fn ready_to_play(&self) -> bool {
+        self.gpu_confirmed
+            && !self.game_dir.trim().is_empty()
+            && Path::new(self.game_dir.trim()).is_dir()
+            && exe_state(&self.game_exe, &self.game_dir) == ExeState::Ok
+            && Path::new(&self.victory_exe()).is_file()
+    }
+
+    fn victory_exe(&self) -> String {
         match self.build {
-            Build::Main => &self.main_exe,
-            Build::New => &self.new_exe,
+            Build::Main => self.main_exe.clone(),
+            Build::New => self.new_exe.clone(),
+            Build::Nvidia => Path::new(self.nv_repo.trim()).join("target").join("release").join("victory.exe").to_string_lossy().into_owned(),
         }
     }
 
@@ -177,6 +262,7 @@ impl Settings {
         match self.build {
             Build::Main => self.main_cache.clone(),
             Build::New => self.new_cache.clone(),
+            Build::Nvidia => self.nv_cache.clone(),
         }
     }
 
@@ -202,6 +288,7 @@ impl Settings {
         match build {
             Build::Main => PathBuf::from(&l).join("victory").join("cache"),
             Build::New => PathBuf::from(&l).join("VIctory").join("cache-new"),
+            Build::Nvidia => PathBuf::from(&l).join("VIctory").join("cache-nv"),
         }
     }
 
@@ -210,6 +297,7 @@ impl Settings {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
+        s.menu_music_volume = s.menu_music_volume.min(MAX_VOLUME);
         // Old defaults (empty, or VIctory's own folders) move to the Sunline folder.
         let old_new = Self::old_cache(Build::New).to_string_lossy().into_owned();
         if s.main_cache.trim().is_empty() {
@@ -218,13 +306,42 @@ impl Settings {
         if s.new_cache.trim().is_empty() || s.new_cache.eq_ignore_ascii_case(&old_new) {
             s.new_cache = Self::home_cache("new");
         }
+        if s.game.is_empty() {
+            s.game_defaults();
+        }
+        if s.build == Build::Nvidia {
+            s.adopt_menu();
+        }
         s
     }
 
-    fn save(&self) {
-        if let Ok(t) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::file(), t);
-        }
+    /// The F1 menu's file (`victory-settings.txt` beside VIctory-NVIDIA's scripts).
+    fn menu_file(&self) -> PathBuf {
+        Path::new(self.nv_repo.trim()).join("victory-settings.txt")
+    }
+
+    /// What was last chosen in the game's F1 menu shows here too (the menu's file goes over
+    /// the script's options, so the two stay the same).
+    fn adopt_menu(&mut self) {
+        let Ok(text) = std::fs::read_to_string(self.menu_file()) else { return };
+        game_settings::adopt(&mut self.game, &self.pending_game, &text);
+        self.sync_game();
+    }
+
+    fn write_menu(&self) -> std::io::Result<()> {
+        let file = self.menu_file();
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => return Err(err),
+        };
+        // SAVE AND RESTART in F1 reads these settings and fixes without the launcher's -More.
+        game_settings::write_settings_file(&file, &game_settings::render_menu(&self.game, &text))
+    }
+
+    fn save(&self) -> std::io::Result<()> {
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        game_settings::write_settings_file(&Self::file(), &text)
     }
 
     /// What each switch means to VIctory, for the chosen build.
@@ -251,7 +368,10 @@ impl Settings {
             ("VICTORY_D3D12_DRED", "light"),
             ("VICTORY_SKIP_PIPELINES", "none"),
             ("VICTORY_CARD_BUFFERS_MIN_MB", "1"),
-            ("VICTORY_CARD_BUFFERS_MB", "1536"),
+            // Every title buffer's copy in card memory, 2 GB of it (victory-sley-fork; measured
+            // here: copying back 22 -> 13 ms a frame, 14.2 -> 22 fps)
+            ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+            ("VICTORY_CARD_BUFFERS_MB", "2048"),
             ("VICTORY_PIPELINE_WAIT_MS", "50"),
             ("VICTORY_PIPELINE_BOOK", "1"),
         ] {
@@ -326,6 +446,9 @@ struct Progress {
     log: Vec<String>,
     running: bool,
     finished_msg: String,
+    failed: bool,
+    stopped: bool,
+    game_started: bool,
 }
 
 struct App {
@@ -334,8 +457,12 @@ struct App {
     child: Arc<Mutex<Option<Child>>>,
     bg: Option<egui::TextureHandle>,
     bg_loaded_for: String,
+    menu_music: MenuMusic,
+    music_error: Option<u32>,
+    save_error: Option<String>,
+    confirm_reset: bool,
     tab: usize,
-    show_startup: bool,
+    page: Page,
     detected: String,
     saved: String,
 }
@@ -344,14 +471,20 @@ impl App {
     fn new(cc: &eframe::CreationContext) -> App {
         style(&cc.egui_ctx);
         fonts(&cc.egui_ctx);
+        let s = Settings::load();
+        let page = Page::initial(s.setup_done, s.ready_to_play());
         App {
-            s: Settings::load(),
+            s,
             progress: Arc::new(Mutex::new(Progress::default())),
             child: Arc::new(Mutex::new(None)),
             bg: None,
             bg_loaded_for: String::new(),
-            tab: 0,
-            show_startup: false,
+            menu_music: MenuMusic::default(),
+            music_error: None,
+            save_error: None,
+            confirm_reset: false,
+            tab: 3,
+            page,
             detected: String::new(),
             saved: String::new(),
         }
@@ -368,7 +501,7 @@ impl App {
         if !self.s.game_dir.trim().is_empty() && !Path::new(self.s.game_dir.trim()).is_dir() {
             bad.push(tr(l, "Game folder not found", "لم يتم العثور على مجلد اللعبة"));
         }
-        if !Path::new(self.s.victory_exe()).is_file() {
+        if !Path::new(&self.s.victory_exe()).is_file() {
             bad.push(tr(l, "VIctory is not built yet", "VIctory غير جاهز بعد"));
         }
         bad
@@ -377,7 +510,24 @@ impl App {
     /// Runs the steps one after another on a thread: warm --used, the game,
     /// warm --used again. Only VIctory's own files and the logs are written.
     fn start(&mut self, mode: &'static str, test: Option<usize>, ctx: egui::Context) {
-        self.s.save();
+        self.menu_music.stop();
+        if self.s.build == Build::Nvidia && mode == "play" {
+            self.s.adopt_menu();
+            if let Err(err) = self.s.write_menu() {
+                *self.progress.lock().unwrap() = Progress {
+                    failed: true,
+                    finished_msg: tr(&self.s.lang, "Could not save game settings", "تعذّر حفظ إعدادات اللعبة"),
+                    line: err.to_string(),
+                    ..Default::default()
+                };
+                return;
+            }
+            self.s.pending_game.clear();
+        }
+        if mode == "play" {
+            self.s.setup_done |= self.s.ready_to_play();
+            self.page = Page::Home;
+        }
         let s = self.s.clone();
         let progress = self.progress.clone();
         let slot = self.child.clone();
@@ -386,8 +536,23 @@ impl App {
             *p = Progress { running: true, ..Default::default() };
         }
         std::thread::spawn(move || {
+            if s.build == Build::Nvidia {
+                let success = run_nvidia(&s, mode, &progress, &slot, &ctx);
+                let mut p = progress.lock().unwrap();
+                p.running = false;
+                p.failed = !success && !p.stopped;
+                p.finished_msg = if p.stopped {
+                    tr(&s.lang, "Stopped", "تم الإيقاف")
+                } else if success {
+                    tr(&s.lang, "Session finished", "انتهت الجلسة")
+                } else {
+                    tr(&s.lang, "The operation failed", "تعذّر إكمال العملية")
+                };
+                ctx.request_repaint();
+                return;
+            }
             let l = s.lang.clone();
-            let exe = s.victory_exe().to_string();
+            let exe = s.victory_exe();
             let profile = test.and_then(|i| s.tests.get(i).cloned());
             let env = s.env(profile.as_ref());
             // A source build (repo\target\diag\victory.exe) runs from its repo; the ready
@@ -441,6 +606,7 @@ impl App {
                 (Some(t), _) => t.name.replace(' ', "-").to_lowercase(),
                 (None, Build::Main) => "main".to_string(),
                 (None, Build::New) => "new".to_string(),
+                (None, Build::Nvidia) => "nvidia".to_string(),
             };
             let mut steps: Vec<(String, Vec<String>, Option<PathBuf>)> = Vec::new();
             // A cache folder of our own choosing gets its shaders translated once.
@@ -591,8 +757,8 @@ impl App {
                 ui.label(RichText::new(what).weak());
             }
         };
-        card(ui, &tr(&l, "Startup - first time only", "البداية - أول مرة فقط"), |ui| {
-            ui.label(RichText::new(tr(&l, "Sunline runs your own copy of the game through VIctory. These steps check everything once. Nothing is ever written into the game folder.", "يشغّل Sunline نسختك من اللعبة عن طريق VIctory. هذه الخطوات تتحقق من كل شيء مرة واحدة. لا يكتب أي شيء داخل مجلد اللعبة أبداً.")).size(15.0));
+        card(ui, &tr(&l, "Game setup", "إعداد اللعبة"), |ui| {
+            ui.label(tr(&l, "Choose your game files and graphics card to get started.", "اختر ملفات اللعبة وكرت الشاشة للبدء."));
         });
 
         let dir_ok = Path::new(self.s.game_dir.trim()).is_dir();
@@ -645,11 +811,15 @@ impl App {
             }
         });
 
-        let build_ok = Path::new(self.s.victory_exe()).is_file();
+        let built = Path::new(&self.s.victory_exe()).is_file();
+        let build_ok = self.s.build_current();
         card(ui, &tr(&l, "4 · VIctory", "4 · VIctory"), |ui| {
             step(ui, build_ok, &tr(&l, "Build VIctory (one time)", "بناء VIctory (مرة واحدة)"), &tr(&l, "Builds the compatibility layer with our fixes, in a window of its own: about 10-15 minutes the first time.", "يبني طبقة التوافق مع إصلاحاتنا في نافذة مستقلة: حوالي 10 إلى 15 دقيقة أول مرة."));
-            if !build_ok && ui.button(tr(&l, "Build it now", "ابنه الآن")).clicked() {
-                run_setup(if self.s.build == Build::Main && Path::new(&here("setup")).join("setup-main.bat").is_file() { "setup-main.bat" } else { "setup-new.bat" });
+            if built && !build_ok {
+                ui.label(RichText::new(tr(&l, "A newer VIctory-NVIDIA with our fixes is ready to build: press Update.", "فيه نسخة أحدث من VIctory-NVIDIA مع إصلاحاتنا جاهزة للبناء: اضغط تحديث.")).color(Color32::from_rgb(230, 170, 60)));
+            }
+            if !build_ok && ui.button(if built { tr(&l, "Update the build", "حدّث البناء") } else { tr(&l, "Build it now", "ابنه الآن") }).clicked() {
+                run_setup(match self.s.build { Build::Nvidia => "setup-nv.bat", Build::Main if Path::new(&here("setup")).join("setup-main.bat").is_file() => "setup-main.bat", _ => "setup-new.bat" }, if self.s.build == Build::Nvidia { self.s.nv_repo.trim() } else { "" });
             }
         });
 
@@ -660,10 +830,6 @@ impl App {
             ui.label(tr(&l, "•  The first session after a change builds shaders: missing shapes for a minute are normal.", "•  أول جلسة بعد أي تغيير تبني الشيدرات: نقص بعض الأشكال لدقيقة أمر طبيعي."));
         });
 
-        if ui.add(egui::Button::new(RichText::new(tr(&l, "✔  Close", "✔  إغلاق")).size(19.0).strong().color(Color32::WHITE)).fill(Color32::from_rgb(60, 170, 110)).min_size(egui::vec2(170.0, 42.0))).clicked() {
-            self.s.setup_done = true;
-            self.show_startup = false;
-        }
     }
 
     fn detect(&mut self) {
@@ -685,39 +851,257 @@ impl App {
         self.s.gpu_confirmed = true;
     }
 
+    /// The game's F1 menu, here: chosen before the game starts, written to the menu's file at PLAY
+    /// (and read back from it at start, so a change made in F1 shows here too).
+    fn game_card(&mut self, ui: &mut egui::Ui) {
+        let l = self.s.lang.clone();
+        let align = if l == "ar" { egui::Align::RIGHT } else { egui::Align::LEFT };
+        let sections = [
+            ("Graphics", "الرسوم", &GAME_ITEMS[..7]),
+            ("Display and controls", "العرض والتحكم", &GAME_ITEMS[7..11]),
+            ("Lighting", "الإضاءة", &GAME_ITEMS[11..]),
+        ];
+        ui.with_layout(egui::Layout::top_down(align), |ui| {
+            ui.heading(tr(&l, "Game settings", "إعدادات اللعبة"));
+            ui.label(tr(&l, "These choices apply next time you play. Press F1 during gameplay to open the same options.", "تطبّق الخيارات في التشغيل التالي. اضغط F1 أثناء اللعب لفتح نفس الخيارات."));
+        });
+        ui.add_space(8.0);
+        for (en, ar, items) in sections {
+            ui.with_layout(egui::Layout::top_down(align), |ui| card(ui, &tr(&l, en, ar), |ui| {
+                for item in items {
+                    if !game_settings::option_visible(&self.s.game, item.var) {
+                        continue;
+                    }
+                    let dir = if l == "ar" {
+                        egui::Layout::right_to_left(egui::Align::Center)
+                    } else {
+                        egui::Layout::left_to_right(egui::Align::Center)
+                    };
+                    ui.with_layout(dir, |ui| {
+                        ui.add_sized([185.0, 36.0], egui::Label::new(tr(&l, item.en, item.ar)));
+                        let now = self.s.game_value(item.var);
+                        let mut selected = now.clone();
+                        let shown = item.values.iter().find(|(value, _, _)| *value == now)
+                            .map(|(_, en, ar)| tr(&l, en, ar))
+                            .unwrap_or_else(|| now.clone());
+                        egui::ComboBox::from_id_salt(item.var).width(245.0).selected_text(shown).show_ui(ui, |ui| {
+                            for (value, en, ar) in item.values {
+                                ui.selectable_value(&mut selected, value.to_string(), tr(&l, en, ar));
+                            }
+                        });
+                        if selected != now {
+                            self.s.game.insert(item.var.into(), selected);
+                            self.s.pending_game.insert(item.var.into());
+                            self.s.sync_game();
+                        }
+                    });
+                }
+            }));
+        }
+        ui.with_layout(egui::Layout::top_down(align), |ui| {
+            if self.s.series_s && !matches!(self.s.dlss.as_str(), "quality" | "off") {
+                ui.label(RichText::new(tr(&l, "Series S may switch this DLSS mode to DLAA. Choose Quality for upscaling.", "قد يتحوّل وضع DLSS هذا إلى DLAA مع Series S. اختر الجودة لرفع الدقة.")).color(Color32::from_rgb(255, 190, 90)));
+            }
+            if ui.button(tr(&l, "Restore recommended settings", "استعادة الإعدادات الموصى بها")).clicked() {
+                self.s.game_defaults();
+                self.s.pending_game.extend(GAME_ITEMS.iter().map(|item| item.var.to_owned()));
+            }
+        });
+    }
+
+    fn music_card(&mut self, ui: &mut egui::Ui) {
+        let l = self.s.lang.clone();
+        let align = if l == "ar" { egui::Align::RIGHT } else { egui::Align::LEFT };
+        ui.with_layout(egui::Layout::top_down(align), |ui| {
+            card(ui, &tr(&l, "Menu music", "موسيقى المنيو"), |ui| {
+                ui.label(tr(
+                    &l,
+                    "Choose a local MP3 or WAV to play in the Sunline menu.",
+                    "اختر ملف MP3 أو WAV من جهازك لتشغيله في منيو Sunline.",
+                ));
+                if let Some(name) = Path::new(&self.s.menu_music_file).file_name() {
+                    ui.label(RichText::new(name.to_string_lossy()).strong())
+                        .on_hover_text(self.s.menu_music_file.as_str());
+                }
+                let row = if l == "ar" {
+                    egui::Layout::right_to_left(egui::Align::Center)
+                } else {
+                    egui::Layout::left_to_right(egui::Align::Center)
+                };
+                ui.with_layout(row, |ui| {
+                    let mut file = self.s.menu_music_file.clone();
+                    if ui.button(tr(&l, "Choose file…", "اختر ملفًا…")).clicked() {
+                        pick_file(&mut file, "Audio (MP3, WAV)", &["mp3", "wav"]);
+                        if file != self.s.menu_music_file {
+                            self.menu_music.stop();
+                            self.music_error = None;
+                            self.s.menu_music_file = file;
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    fn music_controls(&mut self, ui: &mut egui::Ui, l: &str) {
+        let label = if self.s.menu_music_enabled {
+            tr(l, "Stop music", "إيقاف الموسيقى")
+        } else {
+            tr(l, "Play music", "تشغيل الموسيقى")
+        };
+        if ui.button(label).clicked() {
+            self.music_error = None;
+            if self.s.menu_music_enabled {
+                self.s.menu_music_enabled = false;
+                self.menu_music.stop();
+            } else if self.s.menu_music_file.is_empty() {
+                self.page = Page::Music;
+            } else {
+                self.s.menu_music_enabled = true;
+            }
+        }
+        let mut volume = self.s.menu_music_volume;
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = 74.0;
+            let slider = egui::Slider::new(&mut volume, 0..=MAX_VOLUME).suffix("%");
+            if ui.add(slider).on_hover_text(tr(l, "Menu volume", "مستوى صوت المنيو")).changed() {
+                self.s.menu_music_volume = volume;
+            }
+        });
+    }
+
+    fn update_music(&mut self, ctx: &egui::Context, running: bool) {
+        if running || !self.s.menu_music_enabled || self.s.menu_music_file.is_empty() {
+            self.menu_music.stop();
+            return;
+        }
+        if self.music_error.is_some() {
+            return;
+        }
+        let volume = self.s.menu_music_volume;
+        let result = if self.menu_music.is_playing() {
+            self.menu_music.set_volume(volume).and_then(|()| self.menu_music.keep_looping())
+        } else {
+            self.menu_music.play(Path::new(&self.s.menu_music_file), volume)
+        };
+        if let Err(code) = result {
+            self.menu_music.stop();
+            self.music_error = Some(code);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    fn reset_dialog(&mut self, ctx: &egui::Context, running: bool) {
+        if !self.confirm_reset {
+            return;
+        }
+        let l = self.s.lang.clone();
+        egui::Window::new(tr(&l, "Reset all settings?", "ترجع كل الإعدادات؟"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(tr(
+                    &l,
+                    "This clears the saved paths, language, music and game preferences.",
+                    "بيرجع اختيار اللغة والمسارات والموسيقى وإعدادات اللعبة للوضع الافتراضي.",
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button(tr(&l, "Cancel", "إلغاء")).clicked() {
+                        self.confirm_reset = false;
+                    }
+                    if ui.add_enabled(!running, egui::Button::new(tr(&l, "Reset all", "إعادة ضبط الكل"))).clicked() {
+                        self.menu_music.stop();
+                        self.music_error = None;
+                        self.s = Settings::default();
+                        self.s.pending_game.extend(GAME_ITEMS.iter().map(|item| item.var.to_owned()));
+                        self.page = Page::Setup;
+                        self.tab = 3;
+                        self.confirm_reset = false;
+                    }
+                });
+            });
+    }
+
+    fn navigation(&mut self, ctx: &egui::Context, running: bool) {
+        let l = self.s.lang.clone();
+        if l.is_empty() {
+            return;
+        }
+        let panel = if l == "ar" {
+            egui::SidePanel::right("navigation")
+        } else {
+            egui::SidePanel::left("navigation")
+        };
+        panel.exact_width(172.0).resizable(false)
+            .frame(egui::Frame::none().fill(Color32::from_rgb(21, 18, 34)).inner_margin(12.0))
+            .show(ctx, |ui| {
+                let align = if l == "ar" { egui::Align::RIGHT } else { egui::Align::LEFT };
+                ui.with_layout(egui::Layout::top_down(align), |ui| {
+                    for (page, en, ar) in [
+                        (Page::Home, "Home", "الرئيسية"),
+                        (Page::Game, "Game settings (F1)", "إعدادات اللعبة (F1)"),
+                        (Page::Music, "Menu music", "موسيقى المنيو"),
+                        (Page::Advanced, "Advanced", "المتقدمة"),
+                    ] {
+                        if page == Page::Game && self.s.build != Build::Nvidia {
+                            continue;
+                        }
+                        if nav_button(ui, self.page == page, tr(&l, en, ar)).clicked() {
+                            if page == Page::Game && !running {
+                                self.s.adopt_menu();
+                            }
+                            self.page = page;
+                        }
+                    }
+                    if self.page == Page::Advanced {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        if !self.s.dev_mode && self.tab == 4 {
+                            self.tab = 3;
+                        }
+                        for (i, en, ar) in [
+                            (3, "Files", "الملفات"),
+                            (0, "Engine", "المحرك"),
+                            (2, "Graphics", "الرسوم"),
+                            (1, "Patches", "الإصلاحات"),
+                            (4, "Tests", "الاختبارات"),
+                        ] {
+                            if i == 4 && !self.s.dev_mode {
+                                continue;
+                            }
+                            if nav_button(ui, self.tab == i, tr(&l, en, ar)).clicked() {
+                                self.tab = i;
+                            }
+                        }
+                    }
+                });
+            });
+    }
+
     /// The simple view: what is ready, and the one thing to do next.
     fn guide(&mut self, ui: &mut egui::Ui, running: bool) {
         let l = self.s.lang.clone();
-        let ok_c = Color32::from_rgb(120, 230, 150);
         let todo_c = Color32::from_rgb(255, 190, 90);
         let dir_ok = Path::new(self.s.game_dir.trim()).is_dir();
         let state = exe_state(&self.s.game_exe, &self.s.game_dir);
         let exe_ok = state == ExeState::Ok;
         let gpu_ok = self.s.gpu_confirmed;
-        let build_ok = Path::new(self.s.victory_exe()).is_file();
-        let items = [
-            (dir_ok, tr(&l, "Game folder", "مجلد اللعبة")),
-            (exe_ok, tr(&l, "Game EXE", "ملف اللعبة")),
-            (gpu_ok, tr(&l, "Graphics card", "كرت الشاشة")),
-            (build_ok, tr(&l, "VIctory built", "VIctory جاهز")),
-            (self.s.played_once, tr(&l, "First play", "أول تشغيل")),
-        ];
-        ui.add_space(6.0);
-        card(ui, &tr(&l, "Your progress", "تقدمك"), |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (done, name) in &items {
-                    let (mark, c) = if *done { ("✔", ok_c) } else { ("○", Color32::from_gray(150)) };
-                    ui.label(RichText::new(format!("{mark} {name}")).size(16.0).color(c));
-                    ui.add_space(10.0);
-                }
-            });
-        });
-
+        let built = Path::new(&self.s.victory_exe()).is_file();
+        let build_ok = self.s.build_current();
         let title = |t: String| RichText::new(t).size(21.0).strong().color(todo_c);
-        card(ui, &tr(&l, "Next step", "الخطوة التالية"), |ui| {
+        let heading = if !running && dir_ok && exe_ok && gpu_ok && build_ok {
+            tr(&l, "Ready to play", "جاهز للتشغيل")
+        } else if running {
+            tr(&l, "Session in progress", "الجلسة جارية")
+        } else {
+            tr(&l, "Next step", "الخطوة التالية")
+        };
+        card(ui, &heading, |ui| {
             if running {
-                ui.label(title(tr(&l, "Working…", "جاري العمل…")));
-                ui.label(tr(&l, "Follow the bar at the bottom. Keep Sunline open until it says Done.", "تابع الشريط في الأسفل. اترك Sunline مفتوحاً حتى يكتمل."));
+                ui.label(tr(&l, "Keep Sunline open while the session runs.", "خلّ Sunline مفتوح أثناء الجلسة."));
             } else if !dir_ok {
                 ui.label(title(tr(&l, "Choose the game folder", "اختر مجلد اللعبة")));
                 ui.label(tr(&l, "The folder of your game dump - the one with the game's files.", "مجلد نسخة اللعبة - الذي فيه ملفات اللعبة."));
@@ -748,30 +1132,19 @@ impl App {
                     }
                 });
             } else if !build_ok {
-                ui.label(title(tr(&l, "Build VIctory (one time)", "بناء VIctory (مرة واحدة)")));
-                ui.label(tr(&l, "A window opens and builds it: about 10-15 minutes. Come back when it says the build is ready.", "تفتح نافذة وتبنيه: حوالي 10 إلى 15 دقيقة. ارجع هنا عندما تقول إن البناء جاهز."));
-                if ui.button(RichText::new(tr(&l, "🔧  Build it now", "🔧  ابنه الآن")).size(17.0)).clicked() {
-                    run_setup(if self.s.build == Build::Main && Path::new(&here("setup")).join("setup-main.bat").is_file() { "setup-main.bat" } else { "setup-new.bat" });
+                if built {
+                    ui.label(title(tr(&l, "Update VIctory", "تحديث VIctory")));
+                    ui.label(tr(&l, "You can play now or update VIctory to the recommended version.", "تقدر تلعب الآن أو تحدّث VIctory للنسخة الموصى بها."));
+                } else {
+                    ui.label(title(tr(&l, "Build VIctory (one time)", "بناء VIctory (مرة واحدة)")));
+                    ui.label(tr(&l, "A window opens with a progress bar and the time left: about 10-15 minutes. Come back when it says the build is ready.", "تفتح نافذة فيها شريط تقدم والوقت المتبقي: حوالي 10 إلى 15 دقيقة. ارجع هنا عندما تقول إن البناء جاهز."));
+                }
+                if ui.button(RichText::new(if built { tr(&l, "🔧  Update now", "🔧  حدّث الآن") } else { tr(&l, "🔧  Build it now", "🔧  ابنه الآن") }).size(17.0)).clicked() {
+                    run_setup(match self.s.build { Build::Nvidia => "setup-nv.bat", Build::Main if Path::new(&here("setup")).join("setup-main.bat").is_file() => "setup-main.bat", _ => "setup-new.bat" }, if self.s.build == Build::Nvidia { self.s.nv_repo.trim() } else { "" });
                 }
             } else {
-                if self.s.played_once {
-                    ui.label(RichText::new(tr(&l, "Ready - press  ▶ PLAY", "جاهز - اضغط  ▶ تشغيل")).size(21.0).strong().color(ok_c));
-                } else {
-                    ui.label(title(tr(&l, "Press  ▶ PLAY", "اضغط  ▶ تشغيل")));
-                    ui.label(tr(&l, "The first time, Sunline prepares the shaders (the bar at the bottom), then the game opens.", "في المرة الأولى يجهز Sunline الشيدرات (الشريط في الأسفل) ثم تفتح اللعبة."));
-                    ui.label(tr(&l, "When you close the game, leave Sunline open until the bar is done.", "عند إغلاق اللعبة اترك Sunline مفتوحاً حتى ينتهي الشريط."));
-                }
-                ui.add_space(6.0);
-                ui.label(RichText::new(tr(&l, "Mode", "الوضع")).strong());
-                ui.radio_value(&mut self.s.own_upscaler, false, tr(&l, "★ Quality - sharp picture (13 to 14 fps)", "★ الجودة - صورة حادة (13 إلى 14 فريم)"));
-                ui.radio_value(&mut self.s.own_upscaler, true, tr(&l, "★ Performance - about 16 fps, picture a little blurry", "★ الأداء - حوالي 16 فريم، الصورة فيها بعض التغبيش"));
+                ui.label(tr(&l, "Sunline prepares the shaders and opens the game.", "يجهّز Sunline الشيدرز ويفتح اللعبة."));
             }
-        });
-
-        card(ui, &tr(&l, "Tips", "نصائح"), |ui| {
-            ui.label(tr(&l, "•  NVIDIA Control Panel > Shader Cache Size > Unlimited.", "•  لوحة تحكم NVIDIA > Shader Cache Size > Unlimited."));
-            ui.label(tr(&l, "•  Paging file 16 to 48 GB on an SSD; close the browser and Discord while playing.", "•  ملف الصفحات من 16 إلى 48 جيجا على SSD، وأغلق المتصفح وديسكورد أثناء اللعب."));
-            ui.label(tr(&l, "•  Not sure what to do?  🚀 Startup  shows every step.", "•  لست متأكداً؟  🚀 البداية  تشرح كل خطوة."));
         });
     }
 
@@ -802,9 +1175,23 @@ impl App {
         }
     }
 
+    fn open_logs(&self) {
+        if std::fs::create_dir_all(&self.s.logs_dir).is_ok() {
+            let _ = Command::new("explorer").arg(&self.s.logs_dir).spawn();
+        }
+    }
+
     fn stop(&mut self) {
+        self.progress.lock().unwrap().stopped = true;
         if let Some(mut c) = self.child.lock().unwrap().take() {
+            // Only stop this session and the children of its launcher.
+            let mut k = Command::new("taskkill");
+            k.args(["/f", "/t", "/pid", &c.id().to_string()]).stdout(Stdio::null()).stderr(Stdio::null());
+            #[cfg(windows)]
+            k.creation_flags(CREATE_NO_WINDOW);
+            let _ = k.status();
             let _ = c.kill();
+            let _ = c.wait();
         }
     }
 
@@ -903,16 +1290,233 @@ fn here(rel: &str) -> String {
         .unwrap_or_else(|| rel.to_string())
 }
 
-fn run_setup(file: &str) {
+/// One step of a start: `prog args` in `cwd`, its lines read for the progress
+/// bar and written to `tee` (if given). Whether to go on (false: it could not
+/// start, or the user stopped it).
+fn run_step(
+    name: &str,
+    prog: &Path,
+    args: &[String],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    tee: Option<&Path>,
+    progress: &Arc<Mutex<Progress>>,
+    slot: &Arc<Mutex<Option<Child>>>,
+    ctx: &egui::Context,
+) -> bool {
+    {
+        let mut p = progress.lock().unwrap();
+        p.phase = name.to_string();
+        p.done = 0;
+        p.total = 0;
+        p.line.clear();
+        p.log.push(format!("== {name}"));
+    }
+    ctx.request_repaint();
+    let mut cmd = Command::new(prog);
+    cmd.args(args).current_dir(cwd).envs(env).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut starting = progress.lock().unwrap();
+    if starting.stopped {
+        return false;
+    }
+    let mut file = tee.and_then(|path| std::fs::OpenOptions::new().create(true).append(true).open(path).ok());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            starting.line = format!("{}: {e}", prog.display());
+            if let Some(file) = file.as_mut() {
+                let _ = writeln!(file, "{}", starting.line);
+            }
+            return false;
+        }
+    };
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    *slot.lock().unwrap() = Some(child);
+    drop(starting);
+    let file = Arc::new(Mutex::new(file));
+    let pump = |stream: Option<Box<dyn Read + Send>>| {
+        let (progress, ctx, file) = (progress.clone(), ctx.clone(), file.clone());
+        std::thread::spawn(move || {
+            let Some(mut stream) = stream else { return };
+            let mut buf = [0u8; 4096];
+            let mut cur = String::new();
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                for ch in String::from_utf8_lossy(&buf[..n]).chars() {
+                    if ch == '\r' || ch == '\n' {
+                        if !cur.trim().is_empty() {
+                            take_line(&progress, &cur);
+                            if let Some(f) = file.lock().unwrap().as_mut() {
+                                let _ = writeln!(f, "{cur}");
+                            }
+                            ctx.request_repaint();
+                        }
+                        cur.clear();
+                    } else {
+                        cur.push(ch);
+                    }
+                }
+            }
+        })
+    };
+    let a = pump(out.map(|o| Box::new(o) as Box<dyn Read + Send>));
+    let b = pump(err.map(|e| Box::new(e) as Box<dyn Read + Send>));
+    let status = loop {
+        let mut g = slot.lock().unwrap();
+        match g.as_mut() {
+            Some(c) => match c.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) => {}
+                Err(_) => break None,
+            },
+            None => break None,
+        }
+        drop(g);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    };
+    *slot.lock().unwrap() = None;
+    let _ = (a.join(), b.join());
+    if let Some(exit) = status {
+        let ended = format!("{name} ({exit})");
+        if !exit.success() {
+            progress.lock().unwrap().line = ended.clone();
+        }
+        if let Some(file) = file.lock().unwrap().as_mut() {
+            let _ = writeln!(file, "{ended}");
+        }
+    }
+    ctx.request_repaint();
+    status.is_some_and(|exit| exit.success())
+}
+
+/// The VIctory-NVIDIA start: Microsoft's D3D12 runtime 1.614 (its script),
+/// NVIDIA's DLSS files (its script, once), the shaders (once), then its own
+/// launcher with `-Ready` (the shaders earlier runs drew with built first)
+/// and our measured extras.
+fn run_nvidia(s: &Settings, mode: &str, progress: &Arc<Mutex<Progress>>, slot: &Arc<Mutex<Option<Child>>>, ctx: &egui::Context) -> bool {
+    let l = s.lang.clone();
+    let repo = PathBuf::from(s.nv_repo.trim());
+    let exe = PathBuf::from(s.victory_exe());
+    if !exe.is_file() {
+        progress.lock().unwrap().log.push(tr(&l, "VIctory-NVIDIA is not built yet: Files > Set up.", "VIctory-NVIDIA غير مبني بعد: الملفات > إعداد."));
+        return false;
+    }
+    let logs = PathBuf::from(&s.logs_dir);
+    let _ = std::fs::create_dir_all(&logs);
+    let log = logs.join("nvidia-run.log");
+    let _ = std::fs::remove_file(&log);
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    let game_dir = if !s.game_dir.trim().is_empty() {
+        s.game_dir.trim().to_string()
+    } else {
+        Path::new(&s.game_exe).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
+    };
+    env.insert("VICTORY_GAME_DIR".into(), game_dir);
+    if !s.nv_cache.trim().is_empty() {
+        env.insert("VICTORY_CACHE_DIR".into(), s.nv_cache.trim().into());
+    }
+    let ps = PathBuf::from("powershell");
+    let script = |name: &str| -> Vec<String> {
+        vec![
+            "-NoProfile".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-File".into(),
+            repo.join("scripts").join(name).to_string_lossy().into_owned(),
+        ]
+    };
+    // Windows 10: the runtime this build is made for (1.620 made Windows refuse Direct3D 12).
+    let d3d = exe.parent().map(|d| d.join("D3D12")).unwrap_or_default();
+    if d3d.join("D3D12StateObjectCompiler.dll").is_file() {
+        let _ = std::fs::remove_dir_all(&d3d);
+    }
+    if !run_step(&tr(&l, "Checking Microsoft's D3D12 runtime", "التحقق من مكتبة D3D12"), &ps, &script("get-d3d12.ps1"), &repo, &env, Some(&log), progress, slot, ctx) {
+        return false;
+    }
+    if !repo.join("nvidia-sdk").join("Streamline").join("bin").join("x64").is_dir()
+        && !run_step(&tr(&l, "Downloading NVIDIA's DLSS files (once, ~70 MB)", "تنزيل ملفات DLSS من NVIDIA (مرة واحدة)"), &ps, &script("get-nvidia-sdks.ps1"), &repo, &env, Some(&log), progress, slot, ctx)
+    {
+        return false;
+    }
+    let ready = Path::new(s.nv_cache.trim()).join("shaders-ready.txt");
+    if !s.nv_cache.trim().is_empty() && !ready.is_file() {
+        if !run_step(&tr(&l, "Translating the shaders (once, a few minutes)", "ترجمة الشيدرات (مرة واحدة، بضع دقائق)"), &exe, &["shaders".into()], &repo, &env, Some(&log), progress, slot, ctx) {
+            return false;
+        }
+        let _ = std::fs::create_dir_all(s.nv_cache.trim());
+        let _ = std::fs::write(&ready, "ok");
+    }
+    if mode == "all" {
+        return run_step(&tr(&l, "Building all shaders", "بناء كل الشيدرز"), &exe, &["warm".into()], &repo, &env, Some(&log), progress, slot, ctx);
+    }
+    let q = |t: &str| t.replace('\'', "''");
+    // Measured here: title buffer copies in card memory, more pipeline workers; their memory stack
+    // off (on: new memory waited for 51,000 times, 18 s, 12 fps with the card 41% busy).
+    let mut more: Vec<String> = FIXED.iter().map(|(k, v)| format!("{k}='{v}'")).collect();
+    for pair in s.extra.split_whitespace() {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.starts_with("VICTORY_") {
+                more.push(format!("{k}='{}'", q(v)));
+            }
+        }
+    }
+    let dlss = match s.dlss.as_str() {
+        "dlaa" | "quality" | "balanced" | "performance" | "off" => s.dlss.clone(),
+        _ => "quality".into(),
+    };
+    let mut line = format!(
+        "$ErrorActionPreference = 'Stop'; & '{}' -Exe '{}' -Build release -Ready -Dlss {dlss}",
+        q(&repo.join("scripts").join("play-foxhound.ps1").to_string_lossy()),
+        q(&s.game_exe),
+    );
+    if s.series_s {
+        line.push_str(" -SeriesS");
+    }
+    if s.frame_gen && dlss != "off" {
+        line.push_str(" -FrameGen");
+    }
+    line.push_str(&format!(" -More @{{{}}}", more.join(";")));
+    line.push_str("; exit $LASTEXITCODE");
+    run_step(
+        &tr(&l, "Preparing shaders and starting the game", "تجهيز الشيدرز وتشغيل اللعبة"),
+        &ps,
+        &["-NoProfile".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-Command".into(), line],
+        &repo,
+        &env,
+        Some(&log),
+        progress,
+        slot,
+        ctx,
+    )
+}
+
+/// The VIctory-NVIDIA commit and our patch's version this Sunline is made for (setup\\setup-nv.bat builds it).
+const NV_COMMIT: &str = "63b902fe1720a5188ee79d94a88c8de0470f6349 p2";
+
+fn run_setup(file: &str, arg: &str) {
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
         let bat = dir.join("setup").join(file);
-        let _ = Command::new("cmd").arg("/c").arg("start").arg("").arg(bat).spawn();
+        let mut c = Command::new("cmd");
+        c.arg("/c").arg("start").arg("").arg(bat);
+        if !arg.is_empty() {
+            c.arg(arg);
+        }
+        let _ = c.spawn();
     }
 }
 
 fn take_line(progress: &Arc<Mutex<Progress>>, line: &str) {
     let mut p = progress.lock().unwrap();
     let t = line.trim();
+    if t == "Shaders ready. Starting the game." {
+        p.game_started = true;
+        p.line.clear();
+    }
     // "[####----] 1234/3388 36.4%  left ..." from the progress bar
     if let Some(rest) = t.strip_prefix('[') {
         if let Some((_, after)) = rest.split_once("] ") {
@@ -954,7 +1558,7 @@ fn fonts(ctx: &egui::Context) {
 fn style(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     let accent = Color32::from_rgb(255, 92, 160);
-    v.panel_fill = Color32::from_rgb(14, 12, 24);
+    v.panel_fill = Color32::from_rgb(15, 13, 25);
     v.window_fill = Color32::from_rgb(22, 18, 36);
     v.extreme_bg_color = Color32::from_rgb(10, 8, 18);
     v.widgets.inactive.bg_fill = Color32::from_rgb(36, 30, 58);
@@ -962,7 +1566,7 @@ fn style(ctx: &egui::Context) {
     v.widgets.hovered.bg_fill = Color32::from_rgb(60, 44, 92);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(60, 44, 92);
     v.widgets.active.bg_fill = accent;
-    v.selection.bg_fill = accent;
+    v.selection.bg_fill = Color32::from_rgb(99, 42, 82);
     v.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
     v.hyperlink_color = Color32::from_rgb(255, 170, 90);
     ctx.set_visuals(v);
@@ -975,11 +1579,21 @@ fn style(ctx: &egui::Context) {
     ctx.set_style(st);
 }
 
+fn nav_button(ui: &mut egui::Ui, selected: bool, text: String) -> egui::Response {
+    let text = RichText::new(text).color(if selected {
+        Color32::from_rgb(255, 207, 227)
+    } else {
+        Color32::from_rgb(218, 209, 235)
+    });
+    ui.add_sized([ui.available_width(), 31.0], egui::Button::new(text)
+        .fill(if selected { Color32::from_rgb(75, 38, 66) } else { Color32::TRANSPARENT }))
+}
+
 fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
-        .fill(Color32::from_rgba_unmultiplied(28, 22, 46, 230))
+        .fill(Color32::from_rgb(27, 23, 43))
         .rounding(12.0)
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(70, 52, 110)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(58, 46, 81)))
         .inner_margin(14.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -1004,10 +1618,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.load_bg(ctx);
         let running = self.progress.lock().unwrap().running;
-
         egui::TopBottomPanel::top("top").frame(egui::Frame::none().fill(Color32::from_rgb(14, 12, 24)).inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 12.0, bottom: 6.0 })).show(ctx, |ui| {
             // Header: the user's own picture if chosen, else a gradient band.
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 150.0), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 68.0), egui::Sense::hover());
             if let Some(t) = &self.bg {
                 let ts = t.size_vec2();
                 let scale = (rect.width() / ts.x).max(rect.height() / ts.y);
@@ -1015,135 +1628,119 @@ impl eframe::App for App {
                 let uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), shown);
                 ui.painter().image(t.id(), rect, uv, Color32::WHITE);
             } else {
-                let steps = 40;
-                for i in 0..steps {
-                    let f = i as f32 / steps as f32;
-                    let c = Color32::from_rgb(
-                        (40.0 + 215.0 * f) as u8,
-                        (20.0 + 72.0 * f) as u8,
-                        (90.0 + 70.0 * (1.0 - f)) as u8,
-                    );
-                    let x0 = rect.left() + rect.width() * f;
-                    let r = egui::Rect::from_min_max(
-                        egui::pos2(x0, rect.top()),
-                        egui::pos2(x0 + rect.width() / steps as f32 + 1.0, rect.bottom()),
-                    );
-                    ui.painter().rect_filled(r, 0.0, c);
-                }
+                let mut gradient = egui::Mesh::default();
+                gradient.colored_vertex(rect.left_top(), Color32::from_rgb(38, 25, 65));
+                gradient.colored_vertex(rect.right_top(), Color32::from_rgb(117, 42, 73));
+                gradient.colored_vertex(rect.right_bottom(), Color32::from_rgb(79, 28, 56));
+                gradient.colored_vertex(rect.left_bottom(), Color32::from_rgb(24, 20, 42));
+                gradient.add_triangle(0, 1, 2);
+                gradient.add_triangle(0, 2, 3);
+                ui.painter().add(egui::Shape::mesh(gradient));
             }
-            ui.painter().rect_filled(
-                egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 56.0), rect.right_bottom()),
-                0.0,
-                Color32::from_black_alpha(150),
-            );
+            if self.bg.is_some() {
+                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(140));
+            }
             ui.painter().text(
-                egui::pos2(rect.left() + 18.0, rect.bottom() - 30.0),
+                egui::pos2(rect.left() + 18.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 "SUNLINE",
                 egui::FontId::proportional(30.0),
                 Color32::WHITE,
             );
             ui.painter().text(
-                egui::pos2(rect.right() - 18.0, rect.bottom() - 30.0),
+                egui::pos2(rect.right() - 18.0, rect.center().y),
                 egui::Align2::RIGHT_CENTER,
-                "for VIctory  ·  NVIDIA build",
+                if self.s.build == Build::Nvidia { "VIctory-NVIDIA" } else { "VIctory" },
                 egui::FontId::proportional(15.0),
                 Color32::from_gray(210),
             );
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
+            if !self.s.lang.is_empty() {
                 let l = self.s.lang.clone();
-                if ui.button(RichText::new(tr(&l, "🚀  Startup", "🚀  البداية")).size(16.0)).clicked() {
-                    self.show_startup = !self.show_startup;
-                }
-                let label = if self.s.advanced { tr(&l, "◀  Simple view", "◀  العرض البسيط") } else { tr(&l, "⚙  Settings", "⚙  الإعدادات") };
-                if ui.button(RichText::new(label).size(16.0)).clicked() {
-                    self.s.advanced = !self.s.advanced;
-                    self.s.save();
-                }
-                let other = if l == "ar" { "English" } else { "العربية" };
-                if ui.button(RichText::new(format!("🌐 {}", tr(&l, other, other))).size(16.0)).clicked() {
-                    self.s.lang = if l == "ar" { "en".into() } else { "ar".into() };
-                }
-                if !self.s.advanced || self.show_startup {
-                    return;
-                }
-                let mut names = vec!["Play", "Patches", "Graphics", "Files"];
-                if self.s.dev_mode {
-                    names.push("Tests");
-                }
-                if self.tab >= names.len() {
-                    self.tab = 0;
-                }
-                for (i, name) in names.iter().enumerate() {
-                    if ui.selectable_label(self.tab == i, RichText::new(*name).size(17.0)).clicked() {
-                        self.tab = i;
-                    }
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(tr(&l, "★ Performance", "★ الأداء")).on_hover_text(tr(&l, "About 16 fps instead of 13 to 14: the game's own upscaler instead of FSR4. The picture is a little blurry.", "حوالي 16 فريم بدل 13 إلى 14: مكبّر اللعبة بدل FSR4. الصورة فيها بعض التغبيش.")).clicked() {
-                        self.s.recommended_fast();
+                    let language = if l == "ar" { "English".to_owned() } else { tr("ar", "", "العربية") };
+                    if ui.button(language).clicked() {
+                        self.s.lang = if l == "ar" { "en".into() } else { "ar".into() };
                     }
-                    if ui.button(tr(&l, "★ Quality", "★ الجودة")).on_hover_text(tr(&l, "The sharpest picture with the best frame rate measured (13 to 14 fps)", "أوضح صورة مع أفضل أداء تم قياسه (13 إلى 14 فريم)")).clicked() {
-                        self.s.recommended();
+                    if ui.add_enabled(!running, egui::Button::new(tr(&l, "Reset all settings", "إعادة ضبط الإعدادات"))).clicked() {
+                        self.confirm_reset = true;
                     }
                 });
-            });
-            ui.separator();
+            }
         });
         egui::TopBottomPanel::bottom("bottom").frame(egui::Frame::none().fill(Color32::from_rgb(18, 14, 30)).inner_margin(12.0)).show(ctx, |ui| {
-            {
+            let l = self.s.lang.clone();
+            if let Some(error) = &self.save_error {
+                ui.label(tr(&l, "Could not save settings", "تعذّر حفظ الإعدادات")).on_hover_text(error.as_str());
+            }
+            if l.is_empty() {
+                return;
+            }
+            if let Some(code) = self.music_error {
+                ui.label(tr(&l, "Could not play menu music", "تعذّر تشغيل موسيقى المنيو"))
+                    .on_hover_text(format!("Windows audio error {code}"));
+            }
+            let failed = {
                 let p = self.progress.lock().unwrap();
-                if p.running || !p.phase.is_empty() {
+                if p.running && p.game_started {
+                    ui.label(tr(&l, "Game session", "جلسة اللعب"));
+                } else if p.running && !p.phase.is_empty() {
                     let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
-                    let text = if p.total > 0 {
-                        format!("{}  —  {}/{}  ({:.1}%)", p.phase, p.done, p.total, frac * 100.0)
+                    let label = if p.total > 0 {
+                        format!("{}  {}/{}", p.phase, p.done, p.total)
                     } else {
                         p.phase.clone()
                     };
-                    ui.add(egui::ProgressBar::new(frac).text(text).animate(p.running && p.total == 0));
-                    if !p.line.is_empty() {
-                        ui.label(RichText::new(&p.line).monospace().size(12.0).weak());
-                    }
-                    if !p.running && !p.finished_msg.is_empty() {
-                        ui.label(RichText::new(&p.finished_msg).color(Color32::from_rgb(120, 230, 150)));
-                    }
-                    ui.add_space(6.0);
+                    ui.add(egui::ProgressBar::new(frac).text(label).animate(p.total == 0));
                 }
-            }
-            let problems = self.checks();
-            let l = self.s.lang.clone();
-            ui.horizontal(|ui| {
+                if !p.line.is_empty() {
+                    ui.label(RichText::new(&p.line).monospace().size(12.0).weak());
+                }
+                if !p.running && !p.finished_msg.is_empty() {
+                    let colour = if p.failed { Color32::from_rgb(255, 180, 110) } else { Color32::from_rgb(145, 220, 175) };
+                    ui.label(RichText::new(&p.finished_msg).color(colour));
+                    if p.failed && !p.phase.is_empty() {
+                        ui.label(&p.phase);
+                    }
+                }
+                p.failed
+            };
+            let nav = if l == "ar" { egui::Layout::right_to_left(egui::Align::Center) } else { egui::Layout::left_to_right(egui::Align::Center) };
+            ui.with_layout(nav, |ui| {
                 if running {
-                    if ui.add(egui::Button::new(RichText::new(tr(&l, "■  STOP", "■  إيقاف")).size(20.0)).min_size(egui::vec2(160.0, 44.0))).clicked() {
+                    if ui.add_sized([160.0, 44.0], egui::Button::new(tr(&l, "Stop", "إيقاف"))).clicked() {
                         self.stop();
                     }
                 } else {
-                    let play = egui::Button::new(RichText::new(tr(&l, "▶  PLAY", "▶  تشغيل")).size(22.0).strong().color(Color32::WHITE))
-                        .fill(Color32::from_rgb(230, 70, 140))
+                    let ready = self.s.ready_to_play();
+                    let (en, ar) = if self.page == Page::Setup { ("Finish setup", "إنهاء الإعداد") } else { ("Play", "تشغيل") };
+                    let play = egui::Button::new(RichText::new(tr(&l, en, ar)).size(22.0).strong().color(Color32::from_rgb(24, 16, 30)))
+                        .fill(Color32::from_rgb(255, 145, 189))
                         .min_size(egui::vec2(200.0, 48.0));
-                    if ui.add_enabled(problems.is_empty(), play).clicked() {
-                        self.s.played_once = true;
-                        self.start("play", None, ctx.clone());
+                    if ui.add_enabled(ready, play).clicked() {
+                        if self.page == Page::Setup {
+                            self.s.setup_done = true;
+                            self.page = Page::Home;
+                        } else {
+                            self.start("play", None, ctx.clone());
+                        }
                     }
-                    if ui
-                        .add_enabled(problems.is_empty(), egui::Button::new(tr(&l, "Build all shaders", "بناء كل الشيدرات")).min_size(egui::vec2(160.0, 48.0)))
-                        .on_hover_text(tr(&l, "Every shader the game ever created: hours the first time, resumes where it stopped", "كل شيدرات اللعبة: ساعات في المرة الأولى، ويكمل من حيث توقف"))
-                        .clicked()
-                    {
-                        self.start("all", None, ctx.clone());
+                    self.music_controls(ui, &l);
+                    if !ready && self.page != Page::Setup && ui.button(tr(&l, "Open setup", "فتح الإعداد")).clicked() {
+                        self.page = Page::Setup;
                     }
                 }
+                if failed && ui.button(tr(&l, "Open logs", "فتح السجلات")).clicked() {
+                    self.open_logs();
+                }
             });
-            for p in problems {
-                ui.label(RichText::new(format!("⚠ {p}")).color(Color32::from_rgb(255, 180, 80)));
-            }
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
+        self.navigation(ctx, running);
+        egui::CentralPanel::default().frame(
+            egui::Frame::none().fill(ctx.style().visuals.panel_fill).inner_margin(16.0),
+        ).show(ctx, |ui| {
             if self.s.lang.is_empty() {
                 ui.add_space(30.0);
-                card(ui, "Language  ·  اللغة", |ui| {
+                card(ui, &tr("ar", "", "Language · اللغة"), |ui| {
                     ui.label(RichText::new("Choose your language").size(18.0));
                     ui.label(RichText::new(tr("ar", "", "اختر لغتك")).size(18.0));
                     ui.add_space(8.0);
@@ -1158,30 +1755,44 @@ impl eframe::App for App {
                 });
                 return;
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if self.show_startup {
-                self.startup(ui);
-            } else if !self.s.advanced {
+            let scroll_section = (self.page == Page::Advanced).then_some(self.tab);
+            egui::ScrollArea::vertical().id_salt((self.page, scroll_section)).auto_shrink([false, false]).show(ui, |ui| {
+            if self.page == Page::Setup {
+                ui.add_enabled_ui(!running, |ui| self.startup(ui));
+            } else if self.page == Page::Home {
                 self.guide(ui, running);
+            } else if self.page == Page::Game {
+                ui.add_enabled_ui(!running, |ui| self.game_card(ui));
+            } else if self.page == Page::Music {
+                self.music_card(ui);
             } else {
             {
                 ui.add_enabled_ui(!running, |ui| match self.tab {
                     0 => {
                         card(ui, "Build", |ui| {
                             ui.radio_value(&mut self.s.build, Build::Main, "Old (VIctory-7900XTX first build + our fixes) - faster, some flicker");
-                            ui.radio_value(&mut self.s.build, Build::New, "New (latest 7900XTX + all Belobug ports) - best picture, recommended");
+                            ui.radio_value(&mut self.s.build, Build::New, "New (latest 7900XTX + all Belobug ports)");
+                            ui.radio_value(&mut self.s.build, Build::Nvidia, "VIctory-NVIDIA + our fixes - DLSS, 1440p, frame generation (recommended)");
                         });
-                        card(ui, "Console profile", |ui| {
-                            ui.radio_value(&mut self.s.series_s, true, "Series S — faces with skin, FSR from 720p (recommended)");
-                            ui.radio_value(&mut self.s.series_s, false, "Series X — more detail, heavier");
-                        });
+                        if self.s.build != Build::Nvidia {
+                            card(ui, "Console profile", |ui| {
+                                ui.radio_value(&mut self.s.series_s, true, "Series S — faces with skin, FSR from 720p (recommended)");
+                                ui.radio_value(&mut self.s.series_s, false, "Series X — more detail, heavier");
+                            });
+                        }
                         card(ui, "Shaders", |ui| {
                             ui.checkbox(&mut self.s.warm_before, "Build shaders of places already played before the game starts");
                             ui.checkbox(&mut self.s.warm_after, "Build the shaders the session met after the game closes");
-                            ui.label(RichText::new("Building while playing costs about 1.5 fps, so it is not done.").weak());
+                            if ui.add_enabled(self.checks().is_empty(), egui::Button::new(tr(&self.s.lang, "Build all shaders", "بناء كل الشيدرز"))).clicked() {
+                                self.start("all", None, ctx.clone());
+                            }
                         });
                     }
                     1 => {
+                        if self.s.build == Build::Nvidia {
+                            ui.label(tr(&self.s.lang, "VIctory-NVIDIA applies its compatibility fixes automatically.", "تُطبَّق إصلاحات التوافق تلقائيًا مع VIctory-NVIDIA."));
+                            return;
+                        }
                         card(ui, "Renderer patches (from Belobug)", |ui| {
                             ui.checkbox(&mut self.s.port_descriptors, "Patch 2 · DESCRIPTORS — the game reports changed slots (+2 fps) ✔");
                             ui.checkbox(&mut self.s.port_guard, "Patch 6 · GUARD — shared lock for memory guards (+1.3 fps) ✔");
@@ -1204,6 +1815,17 @@ impl eframe::App for App {
                         });
                     }
                     2 => {
+                        if self.s.build == Build::Nvidia {
+                            if ui.button(tr(&self.s.lang, "Open game settings", "فتح إعدادات اللعبة")).clicked() {
+                                self.s.adopt_menu();
+                                self.page = Page::Game;
+                            }
+                            card(ui, &tr(&self.s.lang, "Advanced launch options", "خيارات تشغيل متقدمة"), |ui| {
+                                ui.label(tr(&self.s.lang, "Extra variables (VICTORY_NAME=value, separated by spaces)", "متغيرات إضافية (VICTORY_NAME=value، افصل بينها بمسافة)"));
+                                ui.text_edit_singleline(&mut self.s.extra);
+                            });
+                            return;
+                        }
                         card(ui, "Resolution", |ui| {
                             if self.s.series_s {
                                 ui.label("Series S: output stays 1920x1080 (its FSR4 only has 1080p tables; 720p crashed). It draws 1280x720 inside.");
@@ -1239,14 +1861,15 @@ impl eframe::App for App {
                         });
                     }
                     3 => {
+                        if ui.button(tr(&self.s.lang, "Open game setup", "فتح إعداد اللعبة")).clicked() {
+                            self.page = Page::Setup;
+                        }
                         card(ui, "Game", |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Folder");
                                 ui.text_edit_singleline(&mut self.s.game_dir);
                                 if ui.button("Choose…").clicked() {
-                                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                        self.s.game_dir = p.to_string_lossy().into_owned();
-                                    }
+                                    self.pick_game_dir();
                                 }
                             });
                             ui.horizontal(|ui| {
@@ -1324,8 +1947,7 @@ impl eframe::App for App {
                         card(ui, "Logs", |ui| {
                             ui.text_edit_singleline(&mut self.s.logs_dir);
                             if ui.button("Open logs folder").clicked() {
-                                let _ = std::fs::create_dir_all(&self.s.logs_dir);
-                                let _ = Command::new("explorer").arg(&self.s.logs_dir).spawn();
+                                self.open_logs();
                             }
                         });
                         card(ui, "Developer", |ui| {
@@ -1380,20 +2002,34 @@ impl eframe::App for App {
             }
             });
         });
+        let running = self.progress.lock().unwrap().running;
+        self.reset_dialog(ctx, running);
+        self.update_music(ctx, running);
         if running {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
-        // Save whenever something changed.
+        // Only acknowledge a settings snapshot after it reaches disk.
         if let Ok(now) = serde_json::to_string(&self.s) {
             if now != self.saved {
-                self.s.save();
-                self.saved = now;
+                match self.s.save() {
+                    Ok(()) => {
+                        self.saved = now;
+                        self.save_error = None;
+                    }
+                    Err(err) => {
+                        let message = err.to_string();
+                        if self.save_error.as_ref() != Some(&message) {
+                            self.save_error = Some(message);
+                            ctx.request_repaint();
+                        }
+                    }
+                }
             }
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.s.save();
+        let _ = self.s.save();
     }
 }
 

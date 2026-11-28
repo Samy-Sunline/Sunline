@@ -1,0 +1,320 @@
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index b7ee76f..3291a4f 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -298,6 +298,11 @@ enum Command {
+     /// launcher do this before the title starts). A while, maybe long on
+     /// slower hardware; an update of the translator or the driver needs it
+     /// again. Stopped, it goes on where it was the next time.
++    /// LOCAL: before a start: the pipelines earlier runs drew with made
++    /// (`warm --used`), then those a run makes while it loads stored in the
++    /// pipeline library the runs start with. Quick after the first time.
++    #[cfg(windows)]
++    Ready,
+     #[cfg(windows)]
+     Preload {
+         /// The title's folder (default: the configured game folder).
+@@ -482,6 +487,20 @@ fn main() -> Result<()> {
+         #[cfg(windows)]
+         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+         #[cfg(windows)]
++        Command::Ready => {
++            warm::run(None, None, false, true, None)?;
++            // The library is filled by the runs themselves (what they load and make); it is
++            // filled here only when there is none yet (68 s each start otherwise).
++            let cfg = victory_core::Config::load()?;
++            let library = cfg.cache_subdir("shaders")?.with_file_name("pipelines").join("host-pipelines.bin");
++            if library.is_file() {
++                println!("the pipeline library is there; the game starts");
++                Ok(())
++            } else {
++                warm::into_library(None)
++            }
++        }
++        #[cfg(windows)]
+         Command::Preload { paths, jobs } => {
+             // The launcher and the F1 menu's restart pass it as a switch.
+             let jobs = jobs
+diff --git a/apps/victory/src/warm.rs b/apps/victory/src/warm.rs
+index 6d3ee9f..acf198f 100644
+--- a/apps/victory/src/warm.rs
++++ b/apps/victory/src/warm.rs
+@@ -105,10 +105,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
+                             state.0.push(ms);
+                             state.1 += usize::from(!there);
+                             let count = state.0.len();
+-                            if count.is_multiple_of(1000) {
+-                                println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
+-                            }
+                             drop(state);
++                            bar(count, all.len(), &keys[n], ms, began);
+                             // One with no host pipeline was left out (a
+                             // pipeline the run's switches leave out, such as
+                             // `CS_RaytracingResolve` without the structure
+@@ -204,6 +202,42 @@ pub fn into_library(jobs: Option<usize>) -> Result<()> {
+     Ok(())
+ }
+ 
++/// LOCAL: a progress bar on one console line (made, left, the pipeline just
++/// made and how long it took, the rate and the time left), at most 4 a second.
++fn bar(count: usize, total: usize, key: &str, ms: f64, began: Instant) {
++    use std::sync::atomic::AtomicU64;
++    static LAST: AtomicU64 = AtomicU64::new(0);
++    let now = began.elapsed().as_millis() as u64;
++    let last = LAST.load(Ordering::Relaxed);
++    if count < total && now.saturating_sub(last) < 250 {
++        return;
++    }
++    if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() && count < total {
++        return;
++    }
++    let total = total.max(1);
++    let done = count.min(total);
++    let width = 30;
++    let filled = done * width / total;
++    let secs = began.elapsed().as_secs_f64().max(0.001);
++    let rate = done as f64 / secs;
++    let left = if rate > 0.0 { ((total - done) as f64 / rate) as u64 } else { 0 };
++    let short: String = key.chars().take(16).collect();
++    print!(
++        "\r[{}{}] {done}/{total} {:.1}%  left {}  now {short} ({ms:.0} ms)  {rate:.1}/s  ~{}h{:02}m   ",
++        "#".repeat(filled),
++        "-".repeat(width - filled),
++        done as f64 * 100.0 / total as f64,
++        total - done,
++        left / 3600,
++        left % 3600 / 60,
++    );
++    let _ = std::io::Write::flush(&mut std::io::stdout());
++    if done == total {
++        println!();
++    }
++}
++
+ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+     m.lock().unwrap_or_else(|e| e.into_inner())
+ }
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index e3a7be8..a0112dc 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -1770,7 +1770,6 @@ impl State {
+ 
+     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+-        #[cfg(feature = "diagnostics")]
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+             return false;
+         }
+@@ -3701,7 +3700,6 @@ impl State {
+     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+         // It may write the arguments a window holds clamped.
+         self.window = None;
+-        #[cfg(feature = "diagnostics")]
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             crate::pipeline::note_drop(self.pipeline as This);
+@@ -5136,7 +5134,6 @@ impl State {
+         count: Option<u64>,
+     ) -> bool {
+         // Skip before the argument clamp can mutate the indirect buffer.
+-        #[cfg(feature = "diagnostics")]
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+             crate::pipeline::note_drop(self.pipeline as This);
+             return false;
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 6671067..2a2832c 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -10174,9 +10174,18 @@ impl Meter {
+         }
+         let Some(caption) = &self.caption else { return };
+         // With frame generation showing more frames than are rendered, both rates.
++        // LOCAL: the pipelines still being made, in the caption.
++        let making = crate::pipeline::making();
++        let shaders = if making == 0 {
++            String::new()
++        } else if crate::pipeline::loading_first() {
++            format!(" | BUILDING SHADERS BEFORE PLAY: {making} left")
++        } else {
++            format!(" | building shaders in the background: {making} left")
++        };
+         let text = match crate::streamline::shown_per_frame() {
+-            1 => format!(" | VIctory-NVIDIA {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+-            per => format!(" | VIctory-NVIDIA {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
++            1 => format!(" | VIctory-NVIDIA {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame{shaders}"),
++            per => format!(" | VIctory-NVIDIA {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame{shaders}", fps * f64::from(per)),
+         };
+         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+         text.push(0);
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index f8cd628..6a49548 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -465,6 +465,13 @@ pub(crate) fn making() -> u64 {
+     make::waiting()
+ }
+ 
++/// LOCAL: whether draws still wait for their pipelines at the start
++/// (`VICTORY_LOAD_FIRST`).
++#[cfg(windows)]
++pub(crate) fn loading_first() -> bool {
++    make::load_first()
++}
++
+ /// Draws and dispatches asked of pipelines left out on purpose since the last
+ /// call (ray-tracing passes without the structure builder).
+ #[cfg(windows)]
+@@ -478,7 +485,7 @@ pub(crate) fn take_left_out() -> u64 {
+ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+ 
+ /// Shader hashes as printed in the pipeline diagnostics.
+-#[cfg(all(windows, feature = "diagnostics"))]
++#[cfg(windows)]
+ fn parse_skip_hashes(value: &str) -> Vec<String> {
+     value
+         .split(',')
+@@ -498,7 +505,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
+         .collect()
+ }
+ 
+-#[cfg(all(windows, feature = "diagnostics"))]
++#[cfg(windows)]
+ fn skipped_shader(p: &Pipeline) -> Option<&str> {
+     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+     let hashes = HASHES.get_or_init(|| {
+@@ -514,13 +521,16 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
+         .map(|shader| shader.hash.as_str())
+ }
+ 
+-#[cfg(all(windows, feature = "diagnostics"))]
++#[cfg(windows)]
+ pub(crate) fn is_skipped(this: This) -> bool {
+     !this.is_null() && skipped_shader(pipeline(this)).is_some()
+ }
+ 
+ /// Counts a draw or dispatch of `this` intentionally skipped or dropped
+ /// for want of a host pipeline (diagnostics).
++#[cfg(all(windows, not(feature = "diagnostics")))]
++pub(crate) fn note_drop(_: This) {}
++
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub(crate) fn note_drop(this: This) {
+     let why = if this.is_null() {
+diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
+index 226f478..ec30a62 100644
+--- a/crates/victory-gpu/src/pipeline/make.rs
++++ b/crates/victory-gpu/src/pipeline/make.rs
+@@ -307,11 +307,60 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+     }
+     if p.made.get().is_none() {
+         start(p, REQUESTED);
++        if load_first() {
++            // LOCAL (VICTORY_LOAD_FIRST): nothing drawn without its pipeline
++            // until the first queue is made: the start is slower, not missing.
++            let started = Instant::now();
++            let (lock, done) = &DONE;
++            let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
++            while p.made.get().is_none() && started.elapsed() < Duration::from_secs(60) {
++                held = done.wait_timeout(held, Duration::from_millis(100)).unwrap_or_else(|e| e.into_inner()).0;
++            }
++            drop(held);
++            return p.made.get()?.as_ref();
++        }
+         wait(p, crate::frame::current());
+     }
+     p.made.get()?.as_ref()
+ }
+ 
++/// LOCAL: `VICTORY_LOAD_FIRST=1`: until the pipelines queued since the start
++/// are all made (none waiting) a draw waits for its pipeline instead of being
++/// left out, so the world is never shown with pieces missing while a cold
++/// cache fills; then the usual budget. `VICTORY_LOAD_FIRST_MAX_S` (default
++/// 900) ends it in any case.
++pub(crate) fn load_first() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    static OPEN: AtomicBool = AtomicBool::new(false);
++    static BEGAN: OnceLock<Instant> = OnceLock::new();
++    static TOLD: AtomicU64 = AtomicU64::new(0);
++    if !*ON.get_or_init(|| std::env::var_os("VICTORY_LOAD_FIRST").is_some_and(|v| v == "1")) {
++        return false;
++    }
++    if OPEN.load(Ordering::Relaxed) {
++        return false;
++    }
++    let began = *BEGAN.get_or_init(Instant::now);
++    let max = std::env::var("VICTORY_LOAD_FIRST_MAX_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(900);
++    let left = waiting();
++    if left == 0 || began.elapsed().as_secs() >= max {
++        if !OPEN.swap(true, Ordering::Relaxed) {
++            tracing::info!(
++                seconds = began.elapsed().as_secs(),
++                left,
++                "VICTORY_LOAD_FIRST: the first pipelines are made; draws no longer wait for theirs"
++            );
++        }
++        return false;
++    }
++    let secs = began.elapsed().as_secs();
++    if secs >= TOLD.load(Ordering::Relaxed) + 5 {
++        TOLD.store(secs, Ordering::Relaxed);
++        tracing::info!(left, seconds = secs, "VICTORY_LOAD_FIRST: making the pipelines before drawing");
++    }
++    true
++}
++
+ /// Makes `p` on this thread if it is not made yet (waiting for a worker
+ /// that is making it); whether it has a host pipeline.
+ pub(crate) fn now(p: &Arc<Pending>) -> bool {
+diff --git a/crates/victory-gpu/src/streamline.rs b/crates/victory-gpu/src/streamline.rs
+index d6c743f..a7ce89c 100644
+--- a/crates/victory-gpu/src/streamline.rs
++++ b/crates/victory-gpu/src/streamline.rs
+@@ -1383,7 +1383,21 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
+     };
+     let sizes: Vec<(u32, Option<[u32; 2]>)> = plan::MODES.iter().map(|&m| (m, optimal(&mut calls, m))).collect();
+     let optimal_of_mode = |m: u32| sizes.iter().find(|s| s.0 == m).and_then(|s| s.1);
++    // LOCAL: where the library gives no mode's size that holds the render
++    // (here every optimal-size query failed or came back smaller, with the
++    // NVIDIA app's own DLSS override on), DLAA: its feature is the output's
++    // size and takes the smaller render as a sub-rectangle.
+     let mode = plan::pick_mode(camera.render, output, optimal_of_mode)
++        .or_else(|| {
++            let fits = camera.render[0] > 0 && camera.render[1] > 0 && camera.render[0] <= output[0] && camera.render[1] <= output[1];
++            if fits {
++                static TOLD: std::sync::Once = std::sync::Once::new();
++                TOLD.call_once(|| {
++                    tracing::warn!(render = ?camera.render, ?output, ?sizes, "DLSS: no mode's optimal size holds the render; DLAA's feature takes it as a sub-rectangle");
++                });
++            }
++            fits.then_some(abi::DLSS_DLAA)
++        })
+         .ok_or_else(|| format!("no DLSS mode takes a {:?} render for a {output:?} output", camera.render))?;
+     let mut options = abi::DlssOptions::new(mode, output, plan.asked.preset);
+     options.pre_exposure = if pre_exposure > 0.0 { pre_exposure } else { 1.0 };
+diff --git a/scripts/play-foxhound.ps1 b/scripts/play-foxhound.ps1
+index 2d3ed3e..c8a5216 100644
+--- a/scripts/play-foxhound.ps1
++++ b/scripts/play-foxhound.ps1
+@@ -44,6 +44,9 @@ param(
+     # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
+     # PRELOAD SHADERS starts this again with it.
+     [switch]$Preload,
++    # LOCAL: the pipelines earlier runs drew with made, and the loading ones put into the pipeline library,
++    # before the game starts (`victory ready`); quick after the first time.
++    [switch]$Ready,
+     [hashtable]$More = @{}
+ )
+ $repo = Split-Path $PSScriptRoot -Parent
+@@ -192,6 +195,11 @@ try {
+         $said = 'Preload {0} after {1:N1} min. Starting the game.' -f $how, ((Get-Date) - $began).TotalMinutes
+         $writer.WriteLine("# $said"); Write-Host $said
+     }
++    elseif ($Ready) {
++        Write-Host 'Building the shaders this game needs before it starts (progress below).'
++        & $victory ready 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine("# ready: $line"); $line }
++        Write-Host 'Shaders ready. Starting the game.'
++    }
+ }
+ finally { Pop-Location }
+ Push-Location $repo
