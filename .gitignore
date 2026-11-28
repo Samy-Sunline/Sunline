@@ -1,5 +1,8 @@
 # build output
 source/target/
+/dist/
+/Sunline.exe
+/VIctory-NVIDIA/
 # made on the player's PC
 launcher.json
 logs/
